@@ -1,0 +1,223 @@
+{
+    "Name": "events",
+    "JobMode": "VISUAL",
+    "JobRunQueuingEnabled": false,
+    "Description": "",
+    "Role": "<ARN_ROLE_NAME>",
+    "ExecutionProperty": {
+        "MaxConcurrentRuns": 1
+    },
+    "Command": {
+        "Name": "glueetl",
+        "ScriptLocation": "s3://<BUCKET_NAME>/glue/scripts/events.py",
+        "PythonVersion": "3"
+    },
+    "DefaultArguments": {
+        "--enable-glue-datacatalog": "true",
+        "--job-bookmark-option": "job-bookmark-disable",
+        "--TempDir": "s3://<BUCKET_NAME>/glue/temporary/",
+        "--spark-event-logs-path": "s3://<BUCKET_NAME>/glue/sparkHistoryLogs/",
+        "--enable-metrics": "true",
+        "--enable-spark-ui": "true",
+        "--enable-job-insights": "true",
+        "--enable-observability-metrics": "true",
+        "--job-language": "python",
+        "--conf": "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.glue_catalog.warehouse=file:///tmp/spark-warehouse --conf spark.eventLog.rolling.enabled=true",
+        "--extra-py-files": "s3://<BUCKET_NAME>/glue/scripts/utils/etl_utils.py",
+        "--datalake-formats": "iceberg",
+        "--etl_name": "events",
+        "--backfill": "false",
+        "--catchup": "false",
+        "--start_date": "1900-01-01",
+        "--end_date": "2100-12-31"
+    },
+    "MaxRetries": 0,
+    "Timeout": 480,
+    "WorkerType": "G.1X",
+    "NumberOfWorkers": 2,
+    "GlueVersion": "5.0",
+    "CodeGenConfigurationNodes": {
+        "node-1771153724380": {
+            "SparkSQL": {
+                "Name": "selection",
+                "Inputs": [
+                    "node-1771153705382",
+                    "node-1771153092307"
+                ],
+                "SqlQuery": "SELECT \n uuid() AS uuid\n,e.event_date\n,split(e.user_mail, '@')[0] AS user_mail\n,UPPER(e.event) AS event\n,UPPER(LEFT(e.system, 1)) AS system\nFROM \nevents e\nCROSS JOIN parameters p\nWHERE 1 = 1\nAND e.event_date >= p.param_start_date\nAND e.event_date <= p.param_end_date\nORDER BY e.event_date DESC",
+                "SqlAliases": [
+                    {
+                        "From": "node-1771153705382",
+                        "Alias": "events"
+                    },
+                    {
+                        "From": "node-1771153092307",
+                        "Alias": "parameters"
+                    }
+                ],
+                "OutputSchemas": [
+                    {
+                        "Columns": [
+                            {
+                                "Name": "param_run_uuid",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "event_date",
+                                "Type": "date"
+                            },
+                            {
+                                "Name": "user_mail",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "event",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "system",
+                                "Type": "string"
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "node-1771170516536": {
+            "CustomCode": {
+                "Name": "output",
+                "Inputs": [
+                    "node-1771515690584",
+                    "node-1771153092307"
+                ],
+                "Code": "from etl_utils import update_success_status, update_failed_status\nimport sys\nspark = glueContext.spark_session\n\n# Si detecta PREVIEW MODE sale para evitar que se ejecute el código a continuación\nif not any(\"--JOB_NAME\" in arg for arg in sys.argv):\n    return dfc\n\nkeys = list(dfc.keys())\n# Obtenemos el 1er DF que contiene los datos seleccionados y registramos vista temporal\nsource_df = dfc[keys[0]].toDF()\nsource_df.createOrReplaceTempView(\"updates_source\")\n\n# Obtenemos el 2do DF que contiene los parámetros utilizados y extraemos los valores necesarios\nparam_df = dfc[keys[1]].toDF()\nrun_uuid = param_df.limit(1).collect()[0][\"param_run_uuid\"]\np_start_date = param_df.limit(1).collect()[0][\"param_start_date\"]\np_end_date = param_df.limit(1).collect()[0][\"param_end_date\"]\n\n# Capturamos snapshot ID actual para rollback en caso de error\nprevious_snapshot_id = None\n\ntry:\n    if source_df.count() > 0:        \n        # Obtener el snapshot ID actual antes de iniciar cambios\n        spark.sql(\"REFRESH TABLE glue_catalog.silver.events\")\n        snapshot_df = spark.sql(\"\"\"\n            SELECT snapshot_id \n            FROM glue_catalog.silver.events.snapshots \n            ORDER BY committed_at DESC \n            LIMIT 1\n        \"\"\")\n        previous_snapshot_id = snapshot_df.collect()[0][\"snapshot_id\"]\n\n        # Ejecución de queries principales\n        spark.sql(f\"\"\"\n            DELETE FROM glue_catalog.silver.events\n            WHERE 1 = 1 \n            AND event_date >= CAST('{p_start_date}' AS DATE)\n            AND event_date <= CAST('{p_end_date}' AS DATE)\n        \"\"\")\n        spark.sql(\"\"\"\n            INSERT INTO glue_catalog.silver.events (uuid, event_date, user_mail, event, system)\n            SELECT\n             uuid\n            ,event_date\n            ,user_mail\n            ,event\n            ,system\n            FROM \n            updates_source\n        \"\"\")\n\n    # Actualización de metadatos de auditoría: success\n    update_success_status(glueContext, run_uuid)\n\nexcept Exception as e:\n    # Rollback a snapshot anterior\n    spark.sql(f\"\"\"\n        CALL glue_catalog.system.rollback_to_snapshot\n            ('glue_catalog.silver.events', {previous_snapshot_id})\n    \"\"\")\n    \n    # Actualización de metadatos de auditoría: failed\n    update_failed_status(glueContext, run_uuid)\n    print(f\"Ejecución abortada. Excepción: {e}\")\n    raise\n\nreturn dfc",
+                "ClassName": "outputTransform",
+                "OutputSchemas": [
+                    {
+                        "Columns": [
+                            {
+                                "Name": "uuid",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "event_date",
+                                "Type": "date"
+                            },
+                            {
+                                "Name": "user_mail",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "event",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "system",
+                                "Type": "string"
+                            }
+                        ]
+                    },
+                    {
+                        "Columns": [
+                            {
+                                "Name": "param_etl_name",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "param_backfill",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "param_catchup",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "param_start_date",
+                                "Type": "date"
+                            },
+                            {
+                                "Name": "param_end_date",
+                                "Type": "date"
+                            },
+                            {
+                                "Name": "param_run_uuid",
+                                "Type": "string"
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "node-1771153092307": {
+            "CustomCode": {
+                "Name": "get_parameters",
+                "Inputs": [
+                    "node-1771153705382"
+                ],
+                "Code": "from etl_utils import calculate_execution_horizons, insert_running_status\nfrom awsglue.utils import getResolvedOptions\nimport sys\nimport uuid\n\n# automático\nargs = getResolvedOptions(sys.argv, ['etl_name', 'catchup', 'backfill', 'start_date', 'end_date'])\n\n# manual para test\n#args = {\n#    \"etl_name\": \"events\",\n#    \"catchup\": \"false\",\n#    \"backfill\": \"true\",\n#    \"start_date\": \"2026-03-21\",\n#    \"end_date\": \"2026-03-21\"\n#}\nargs['run_uuid'] = str(uuid.uuid4())\n\ncollection = calculate_execution_horizons(glueContext, args)\n\n# Inserta registro con status 'running' si no está en PREVIEW MODE\nif any(\"--JOB_NAME\" in arg for arg in sys.argv):\n    insert_running_status(glueContext, collection)\n\nreturn collection\n",
+                "ClassName": "get_parametersTransform",
+                "OutputSchemas": [
+                    {
+                        "Columns": [
+                            {
+                                "Name": "param_etl_name",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "param_backfill",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "param_catchup",
+                                "Type": "string"
+                            },
+                            {
+                                "Name": "param_start_date",
+                                "Type": "date"
+                            },
+                            {
+                                "Name": "param_end_date",
+                                "Type": "date"
+                            },
+                            {
+                                "Name": "param_run_uuid",
+                                "Type": "string"
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "node-1771153705382": {
+            "CatalogIcebergSource": {
+                "Name": "bronze | events",
+                "Database": "bronze",
+                "Table": "events",
+                "AdditionalIcebergOptions": {}
+            }
+        },
+        "node-1771515690584": {
+            "DropDuplicates": {
+                "Name": "drop duplicates",
+                "Inputs": [
+                    "node-1771153724380"
+                ],
+                "Columns": [
+                    [
+                        "event_date"
+                    ],
+                    [
+                        "user_mail"
+                    ],
+                    [
+                        "event"
+                    ],
+                    [
+                        "system"
+                    ]
+                ]
+            }
+        }
+    },
+    "ExecutionClass": "STANDARD"
+}
